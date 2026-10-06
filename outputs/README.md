@@ -1,0 +1,3 @@
+This folder contains final outputs for the project. Sometimes this might include figures, a manuscript, slides, a poster, etc...
+
+This is likely to be empty until the very end of the project.
