@@ -177,8 +177,8 @@ def _warn_mixed_crids(results: list) -> None:
     for r in results:
         name = r.properties['sceneName']
         try:
-            pair = parse_dates(name)
-        except IndexError:
+            pair = tuple(t.strftime('%Y%m%d') for t in parse_times(name))
+        except ValueError:
             continue
         by_pair.setdefault(pair, set()).add(_scene_crid(name))
     mixed = {pair: sorted(c for c in crids if c) for pair, crids in by_pair.items() if len(crids) > 1}
@@ -576,27 +576,43 @@ def download_nisar_gslc(
     return granule_names, downloaded_files
 
 
-def parse_dates(fname: Union[str, Path]) -> Tuple[str, str]:
+_TIMESTAMP_RE = re.compile(r'(\d{8}T\d{6})')
+
+
+def parse_times(fname: Union[str, Path]) -> Tuple[datetime, datetime]:
     """
-    Extract the reference and secondary acquisition dates (``YYYYMMDD``) from
-    a NISAR GUNW scene name, or one of the GeoTIFF filenames written by
-    ``download_nisar`` (which prefixes the layer name with the scene name).
+    Extract a start and end datetime from the ``YYYYMMDDTHHMMSS`` timestamps in
+    a NISAR scene name, or a filename that contains one (such as the GeoTIFFs
+    written by ``download_nisar``, which prefix the layer name with the scene
+    name).
+
+    - GUNW names carry four timestamps (reference start/stop, secondary
+      start/stop, e.g. ``..._20260207T124619_20260207T124654_20260219T124619_20260219T124654_...``)
+      and return ``(reference_start, secondary_start)``.
+    - GSLC names carry two (acquisition start/stop) and return
+      ``(start, stop)``.
 
     Parameters
     ----------
     fname : str | Path
-        Scene name or filename containing the four GUNW acquisition
-        timestamps (e.g. ``..._20260207T124619_20260207T124654_20260219T124619_20260219T124654_...``).
+        Scene name or filename containing the timestamps.
 
     Returns
     -------
-    (reference_date, secondary_date) : tuple of str
-        The reference and secondary acquisition dates as ``YYYYMMDD`` strings.
+    (start, end) : tuple of datetime
+        Use ``.strftime('%Y%m%d')`` for date strings.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two timestamps are found.
     """
-    fname = str(fname)
-    d1 = re.findall(r'_(\d{8})T\d{6}_\d{8}T\d{6}_', fname)[0]
-    d2 = re.findall(r'_\d{8}T\d{6}_\d{8}T\d{6}_(\d{8})T\d{6}_\d{8}T\d{6}_', fname)[0]
-    return d1, d2
+    stamps = _TIMESTAMP_RE.findall(Path(str(fname)).name)
+    if len(stamps) < 2:
+        raise ValueError(f"Expected at least two YYYYMMDDTHHMMSS timestamps in '{fname}'.")
+    start, end = (stamps[0], stamps[2]) if len(stamps) >= 4 else (stamps[0], stamps[1])
+    return (datetime.strptime(start, '%Y%m%dT%H%M%S'),
+            datetime.strptime(end, '%Y%m%dT%H%M%S'))
 
 
 def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
@@ -606,7 +622,7 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
     a single 3D ``(pair, y, x)`` DataArray.
 
     Files sharing the same reference/secondary date pair (as parsed by
-    ``parse_dates``) are deduplicated, keeping only the first (sorted by
+    ``parse_times``) are deduplicated, keeping only the first (sorted by
     filename).
 
     Parameters
@@ -621,15 +637,17 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
     xarray.DataArray
         Stacked cube with dims ``('pair', 'y', 'x')``, coordinates ``pair``
         (date-pair strings ``'YYYYMMDD_YYYYMMDD'``) and pixel-center
-        ``x``/``y`` coordinates. The source CRS is stored in
-        ``da.attrs['crs']``.
+        ``x``/``y`` coordinates. Non-index coordinates ``start`` and ``end``
+        on ``pair`` hold the reference and secondary acquisition start times
+        (``datetime64[ns]``) parsed from the filenames. The source CRS is
+        stored in ``da.attrs['crs']``.
     """
-    arrays, pairs = [], []
+    arrays, pairs, starts, ends = [], [], [], []
     seen = set()
 
     for f in sorted(files):
-        d1, d2 = parse_dates(f)
-        pair_id = f"{d1}_{d2}"
+        start, end = parse_times(f)
+        pair_id = f"{start:%Y%m%d}_{end:%Y%m%d}"
         if pair_id in seen:
             continue
         seen.add(pair_id)
@@ -640,6 +658,8 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
             crs = src.crs
             height, width = src.height, src.width
         pairs.append(pair_id)
+        starts.append(start)
+        ends.append(end)
 
     stack = np.stack(arrays)
     xs = transform.c + (np.arange(width) + 0.5) * transform.a
@@ -647,7 +667,11 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
 
     da = xr.DataArray(
         stack, dims=('pair', 'y', 'x'),
-        coords={'pair': pairs, 'y': ys, 'x': xs},
+        coords={
+            'pair': pairs, 'y': ys, 'x': xs,
+            'start': ('pair', np.array(starts, dtype='datetime64[ns]')),
+            'end': ('pair', np.array(ends, dtype='datetime64[ns]')),
+        },
         name=band_name,
     )
     da.attrs['crs'] = str(crs)
@@ -733,7 +757,7 @@ def interpolate_radar_grid_to_dem(
     -------
     xarray.DataArray
         ``(y, x)`` for a single file, or ``(pair, y, x)`` for several, where
-        ``pair`` is ``'YYYYMMDD_YYYYMMDD'`` (see ``parse_dates``). Shares the
+        ``pair`` is ``'YYYYMMDD_YYYYMMDD'`` (see ``parse_times``). Shares the
         DEM's coordinates and CRS.
     """
     if not isinstance(dem, xr.DataArray):
@@ -771,8 +795,8 @@ def interpolate_radar_grid_to_dem(
             x_pts, y_pts, z, dtype=src.dtype,
         ))
         try:
-            pairs.append('_'.join(parse_dates(f)))
-        except IndexError:
+            pairs.append('_'.join(t.strftime('%Y%m%d') for t in parse_times(f)))
+        except ValueError:
             pairs.append(f.stem)
 
     name = band_name or 'radar_grid_layer'
@@ -791,7 +815,6 @@ def interpolate_radar_grid_to_dem(
 # =============================================================================
 
 _GSLC_FILE_RE = re.compile(r'^(?P<scene>.+)_(?P<layer>backscatter|NEBZ)_(?P<pol>[HV]{2})\.tif$')
-_TIMESTAMP_RE = re.compile(r'(\d{8}T\d{6})')
 
 
 def _open_2d(src: Union[str, Path, xr.DataArray]) -> xr.DataArray:
@@ -873,18 +896,6 @@ def calculate_snr(
     snr.name = 'snr'
     snr.attrs = {'units': 'dB' if db else 'linear'}
     return snr.rio.write_crs(bs.rio.crs) if bs.rio.crs is not None else snr
-
-
-def parse_acquisition_time(fname: Union[str, Path]) -> datetime:
-    """
-    Acquisition start time from a NISAR scene name or a filename that begins
-    with one (the first ``YYYYMMDDTHHMMSS`` token; GSLC names carry start and
-    stop times).
-    """
-    m = _TIMESTAMP_RE.search(Path(str(fname)).name)
-    if m is None:
-        raise ValueError(f"No YYYYMMDDTHHMMSS timestamp found in '{fname}'.")
-    return datetime.strptime(m.group(1), '%Y%m%dT%H%M%S')
 
 
 def _match_gslc_files(
@@ -986,7 +997,7 @@ def build_snr_timeseries(
     if not m['matched']:
         raise ValueError(f"No matching backscatter/NEBZ file pairs found for polarization '{polarization}'.")
 
-    items = sorted(((parse_acquisition_time(scene), scene, bs, nz) for scene, bs, nz in m['matched']),
+    items = sorted(((parse_times(scene)[0], scene, bs, nz) for scene, bs, nz in m['matched']),
                    key=lambda t: (t[0], t[1]))
     times = [t[0] for t in items]
     if len(set(times)) != len(times):
