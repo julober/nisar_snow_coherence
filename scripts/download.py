@@ -1,7 +1,7 @@
 import logging
 import re
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -177,7 +177,7 @@ def _warn_mixed_crids(results: list) -> None:
     for r in results:
         name = r.properties['sceneName']
         try:
-            pair = tuple(t.strftime('%Y%m%d') for t in parse_times(name))
+            pair = tuple(t.strftime('%Y%m%d') for t in parse_times(name, 0))
         except ValueError:
             continue
         by_pair.setdefault(pair, set()).add(_scene_crid(name))
@@ -579,12 +579,13 @@ def download_nisar_gslc(
 _TIMESTAMP_RE = re.compile(r'(\d{8}T\d{6})')
 
 
-def parse_times(fname: Union[str, Path]) -> Tuple[datetime, datetime]:
+def parse_times(fname: Union[str, Path], utc_offset_hours: float) -> Tuple[datetime, datetime]:
     """
     Extract a start and end datetime from the ``YYYYMMDDTHHMMSS`` timestamps in
     a NISAR scene name, or a filename that contains one (such as the GeoTIFFs
     written by ``download_nisar``, which prefix the layer name with the scene
-    name).
+    name). Timestamps in filenames are UTC; this is the one place they are
+    shifted to local time.
 
     - GUNW names carry four timestamps (reference start/stop, secondary
       start/stop, e.g. ``..._20260207T124619_20260207T124654_20260219T124619_20260219T124654_...``)
@@ -596,11 +597,20 @@ def parse_times(fname: Union[str, Path]) -> Tuple[datetime, datetime]:
     ----------
     fname : str | Path
         Scene name or filename containing the timestamps.
+    utc_offset_hours : float
+        Fixed offset from UTC in hours, with no daylight saving (e.g. ``-7``
+        for MST year-round; pass ``0`` to keep UTC). Required, so the local
+        zone is always an explicit choice. A fixed offset keeps intervals
+        exact across DST changes; named zones are intentionally unsupported.
+        To derive the offset from a location, look up its standard-time zone
+        yourself (e.g. with ``timezonefinder``); it is not detected here.
 
     Returns
     -------
     (start, end) : tuple of datetime
-        Use ``.strftime('%Y%m%d')`` for date strings.
+        Naive local standard time (UTC + ``utc_offset_hours``); the date is
+        taken after the shift, so it can differ from the UTC date. Use
+        ``.strftime('%Y%m%d')`` for date strings.
 
     Raises
     ------
@@ -611,11 +621,12 @@ def parse_times(fname: Union[str, Path]) -> Tuple[datetime, datetime]:
     if len(stamps) < 2:
         raise ValueError(f"Expected at least two YYYYMMDDTHHMMSS timestamps in '{fname}'.")
     start, end = (stamps[0], stamps[2]) if len(stamps) >= 4 else (stamps[0], stamps[1])
-    return (datetime.strptime(start, '%Y%m%dT%H%M%S'),
-            datetime.strptime(end, '%Y%m%dT%H%M%S'))
+    shift = timedelta(hours=utc_offset_hours)
+    return (datetime.strptime(start, '%Y%m%dT%H%M%S') + shift,
+            datetime.strptime(end, '%Y%m%dT%H%M%S') + shift)
 
 
-def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
+def build_cube(files: List[Union[str, Path]], band_name: str, utc_offset_hours: float) -> xr.DataArray:
     """
     Stack a list of single-band GeoTIFFs sharing a common grid (e.g. the same
     layer across multiple date pairs, as returned by ``download_nisar``) into
@@ -631,6 +642,9 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
         Paths to single-band GeoTIFFs, all on the same grid.
     band_name : str
         Name to assign to the returned DataArray.
+    utc_offset_hours : float
+        Fixed offset from UTC (no DST) applied to the filename timestamps,
+        e.g. ``-7`` for MST. Required; see ``parse_times``.
 
     Returns
     -------
@@ -639,14 +653,18 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
         (date-pair strings ``'YYYYMMDD_YYYYMMDD'``) and pixel-center
         ``x``/``y`` coordinates. Non-index coordinates ``start`` and ``end``
         on ``pair`` hold the reference and secondary acquisition start times
-        (``datetime64[ns]``) parsed from the filenames. The source CRS is
-        stored in ``da.attrs['crs']``.
+        (``datetime64[ns]``), and the ``pair`` strings are their dates, all in
+        local standard time (UTC + ``utc_offset_hours``, recorded in each
+        coordinate's ``attrs['utc_offset_hours']``). Because the offset is
+        fixed, intervals between coordinates are exact across DST changes;
+        localize with a fixed zone (e.g. ``'Etc/GMT+7'``) if tz-aware values
+        are needed. The source CRS is stored in ``da.attrs['crs']``.
     """
     arrays, pairs, starts, ends = [], [], [], []
     seen = set()
 
     for f in sorted(files):
-        start, end = parse_times(f)
+        start, end = parse_times(f, utc_offset_hours)
         pair_id = f"{start:%Y%m%d}_{end:%Y%m%d}"
         if pair_id in seen:
             continue
@@ -675,6 +693,7 @@ def build_cube(files: List[Union[str, Path]], band_name: str) -> xr.DataArray:
         name=band_name,
     )
     da.attrs['crs'] = str(crs)
+    da['start'].attrs['utc_offset_hours'] = da['end'].attrs['utc_offset_hours'] = utc_offset_hours
     return da.to_dataset()
 
 
@@ -728,6 +747,7 @@ def _interp_radar_grid(
 def interpolate_radar_grid_to_dem(
     dem: Union[str, Path, xr.DataArray],
     files: List[Union[str, Path]],
+    utc_offset_hours: float,
     band_name: str = None,
 ) -> xr.DataArray:
     """
@@ -750,6 +770,10 @@ def interpolate_radar_grid_to_dem(
     files : list of str | Path
         Multi-band GeoTIFFs on the radar grid, one per date pair, all
         sharing the same grid and heights.
+    utc_offset_hours : float
+        Fixed offset from UTC (no DST) applied to the filename timestamps,
+        e.g. ``-7`` for MST. Required; use the same value as ``build_cube``
+        so the ``pair`` strings match.
     band_name : str, optional
         Name for the returned array. Defaults to ``'radar_grid_layer'``.
 
@@ -757,7 +781,8 @@ def interpolate_radar_grid_to_dem(
     -------
     xarray.DataArray
         ``(y, x)`` for a single file, or ``(pair, y, x)`` for several, where
-        ``pair`` is ``'YYYYMMDD_YYYYMMDD'`` (see ``parse_times``). Shares the
+        ``pair`` is ``'YYYYMMDD_YYYYMMDD'`` in local standard time (see
+        ``parse_times``). Shares the
         DEM's coordinates and CRS.
     """
     if not isinstance(dem, xr.DataArray):
@@ -795,7 +820,7 @@ def interpolate_radar_grid_to_dem(
             x_pts, y_pts, z, dtype=src.dtype,
         ))
         try:
-            pairs.append('_'.join(t.strftime('%Y%m%d') for t in parse_times(f)))
+            pairs.append('_'.join(t.strftime('%Y%m%d') for t in parse_times(f, utc_offset_hours)))
         except ValueError:
             pairs.append(f.stem)
 
@@ -936,6 +961,7 @@ def _match_gslc_files(
 def build_snr_timeseries(
     backscatter_files: List[Union[str, Path]],
     nebz_files: List[Union[str, Path]],
+    utc_offset_hours: float,
     polarization: str = 'HH',
     resampling: str = 'bilinear',
     db: bool = False,
@@ -953,6 +979,9 @@ def build_snr_timeseries(
     backscatter_files, nebz_files : list of str | Path
         Files written by ``download_nisar_gslc``
         (``{scene}_backscatter_{pol}.tif`` / ``{scene}_NEBZ_{pol}.tif``).
+    utc_offset_hours : float
+        Fixed offset from UTC (no DST) applied to the filename timestamps,
+        e.g. ``-7`` for MST. Required; see ``parse_times``.
     polarization : str, default='HH'
         Only files of this polarization are used.
     resampling : str, default='bilinear'
@@ -965,8 +994,9 @@ def build_snr_timeseries(
     -------
     xarray.DataArray
         ``(date, y, x)`` array named ``'snr'``. ``date`` holds the acquisition
-        start time (xarray stores Python datetimes as ``datetime64``), sorted
-        ascending, with a ``scene`` coordinate alongside.
+        start time in local standard time (UTC + ``utc_offset_hours``; see
+        ``parse_times``), sorted ascending, with a ``scene`` coordinate
+        alongside. The offset is recorded in ``da['date'].attrs['utc_offset_hours']``.
 
     Warns
     -----
@@ -997,7 +1027,7 @@ def build_snr_timeseries(
     if not m['matched']:
         raise ValueError(f"No matching backscatter/NEBZ file pairs found for polarization '{polarization}'.")
 
-    items = sorted(((parse_times(scene)[0], scene, bs, nz) for scene, bs, nz in m['matched']),
+    items = sorted(((parse_times(scene, utc_offset_hours)[0], scene, bs, nz) for scene, bs, nz in m['matched']),
                    key=lambda t: (t[0], t[1]))
     times = [t[0] for t in items]
     if len(set(times)) != len(times):
@@ -1020,4 +1050,5 @@ def build_snr_timeseries(
     out = out.assign_coords(scene=('date', [t[1] for t in items]))
     out.name = 'snr'
     out.attrs = {'units': 'dB' if db else 'linear'}
+    out['date'].attrs['utc_offset_hours'] = utc_offset_hours
     return out.rio.write_crs(ref.rio.crs)
