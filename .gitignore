@@ -2,5 +2,6 @@
 data/* 
 data/data/* 
 
+notebooks/cache
 notebooks/cache/aiohttp_cache.sqlite
 scripts/__pycache__/
