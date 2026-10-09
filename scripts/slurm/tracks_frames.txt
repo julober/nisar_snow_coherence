@@ -1,2 +1,5 @@
 # track frame aoi_path   (one job per line; update --array in download_nisar.slurm to match)
 19 21 /bsuhome/julialober/scratch/coherence_data/aso/er_20260318/ASO_EastRiver_2026Mar18_swe_50m.tif
+120 21 /bsuhome/julialober/scratch/coherence_data/aso/er_20260318/ASO_EastRiver_2026Mar18_swe_50m.tif
+128 69 /bsuhome/julialober/scratch/coherence_data/aso/er_20260318/ASO_EastRiver_2026Mar18_swe_50m.tif
+27 69 /bsuhome/julialober/scratch/coherence_data/aso/er_20260318/ASO_EastRiver_2026Mar18_swe_50m.tif
