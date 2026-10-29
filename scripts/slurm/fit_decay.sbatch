@@ -1,13 +1,13 @@
 #!/bin/bash
-# Fit the temporal decay model, one spatial tile per array task. See scripts/fit_decay.py.
+# Worker for the temporal decay fit (scripts/fit_decay.py): one spatial tile per array task.
+# Don't call this directly; submit everything with the wrapper, which runs --init, submits this file as an array
+# job and then once more to write the GeoTIFFs when all tiles are done:
 #
-# 1) Once, on the login node (same data/fit arguments as below; prints the number of tiles N):
-#      python scripts/fit_decay.py --init --zarr $ZARRS --var $VAR --output $OUT [--start-date ... --end-date ...]
-# 2) sbatch --array=0-$((N-1))%50 slurm/fit_decay.sbatch      (%50 = at most 50 tasks at once)
-#    Redo failed tiles only:  sbatch --array=3,17 slurm/fit_decay.sbatch
-# 3) After it finishes:  python scripts/fit_decay.py --finalize --output $OUT
+#   bash scripts/slurm/submit_fit_decay.sh --zarr <stores...> --var coherence --output <out.zarr> [--start-date ...]
 #
-# Override the settings below at submit time, e.g.  sbatch --export=ALL,VAR=coherence_20m ...
+# All script arguments (everything after the file name) are passed on to fit_decay.py. Cluster settings (partition,
+# time, memory, mail, logs) are the #SBATCH lines below and apply to both the tile tasks and the GeoTIFF job.
+# Must be submitted from the repo root, as the paths are relative to it (the wrapper does this).
 #SBATCH --job-name=fit_decay
 #SBATCH --output=/bsuhome/julialober/logs/%x_%A_%a.out
 #SBATCH --cpus-per-task=1        # the fit is a single-threaded loop; parallelism comes from the array
@@ -19,17 +19,15 @@
 
 
 set -euo pipefail
-mkdir -p logs
-
-# ---- settings (must match the --init call) ----
-ZARRS="${ZARRS:-data/nisar/zarrs/all_pairs/track019/gunw_80m.zarr}"   # space-separated, one per track
-VAR="${VAR:-coherence}"                                 # variable name inside the stores
-OUT="${OUT:-data/nisar/zarrs/all_pairs/track019/decay_80m.zarr}"
-#EXTRA="${EXTRA:---start-date 2025-12-01 --end-date 2026-02-28 }"                                          # e.g. "--start-date 2026-01-01 --end-date 2026-04-30"
-EXTRA="${EXTRA:-}" 
+# No mkdir for the log folder here: Slurm opens the --output file before this script starts, so the wrapper
+# (submit_fit_decay.sh) creates that folder at submit time.
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate coherence_v2
 
-# $ZARRS and $EXTRA are meant to split into several words
-python scripts/fit_decay.py --tile-index "$SLURM_ARRAY_TASK_ID" --zarr $ZARRS --var "$VAR" --output "$OUT" $EXTRA
+# FIT_STEP=finalize is set by the wrapper for the last job; otherwise this is a tile task of the array.
+if [[ "${FIT_STEP:-}" == "finalize" ]]; then
+    python scripts/fit_decay.py --finalize "$@"
+else
+    python scripts/fit_decay.py --tile-index "$SLURM_ARRAY_TASK_ID" "$@"
+fi

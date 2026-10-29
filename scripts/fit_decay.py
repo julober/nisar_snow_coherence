@@ -1,6 +1,10 @@
 """
 Fit the temporal coherence decay model per pixel over one or more track Zarr cubes, in spatial tiles, so the work
-can be split over a Slurm job array (see ``slurm/fit_decay.sbatch``).
+can be split over a Slurm job array.
+
+On the cluster, submit everything in one command with the wrapper, which takes the arguments below:
+    bash scripts/slurm/submit_fit_decay.sh --zarr A.zarr B.zarr --var coherence_80m --output out.zarr
+(it runs --init, submits one task per tile with ``scripts/slurm/fit_decay.sbatch``, then --finalize).
 
 Input: the ``gunw_<res>.zarr`` stores written by ``scripts/gunw_zarr.py`` (dims ``(pair, y, x)``, coords ``start``
 and ``end``). With several stores (one per track) all pairs are stacked and fit together; the tracks must be on the
@@ -12,7 +16,7 @@ The date window and ``--max-days`` are applied to every track: a pair is kept if
 Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``tau_err``, ``gamma_inf_err``, ``n_pairs`` and
 ``success``. Its chunks are the tiles, so array tasks never write the same chunk.
 
-Steps (use the same data/fit arguments for all three, they define which pairs are fit):
+Steps the wrapper runs, to do by hand (use the same data/fit arguments for all three, they define which pairs are fit):
     python scripts/fit_decay.py --init --zarr A.zarr B.zarr --var coherence_80m --output out.zarr   # once, prints tiles
     python scripts/fit_decay.py --tile-index 0 --zarr A.zarr B.zarr --var coherence_80m --output out.zarr
     python scripts/fit_decay.py --finalize --output out.zarr                                         # GeoTIFFs
