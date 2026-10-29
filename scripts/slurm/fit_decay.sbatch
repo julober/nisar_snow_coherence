@@ -9,21 +9,24 @@
 #
 # Override the settings below at submit time, e.g.  sbatch --export=ALL,VAR=coherence_20m ...
 #SBATCH --job-name=fit_decay
-#SBATCH --output=logs/%x_%A_%a.out
+#SBATCH --output=/bsuhome/julialober/logs/%x_%A_%a.out
 #SBATCH --cpus-per-task=1        # the fit is a single-threaded loop; parallelism comes from the array
 #SBATCH --mem=8G                 # PLACEHOLDER: a 256x256 tile of all pairs is small; raise for many pairs
-#SBATCH --time=02:00:00          # PLACEHOLDER: depends on pairs per pixel; check one task's runtime first
-##SBATCH --partition=YOUR_PARTITION
-##SBATCH --account=YOUR_ACCOUNT
+#SBATCH --time=03:00:00          # PLACEHOLDER: depends on pairs per pixel; check one task's runtime first
+#SBATCH -p bsudfq # queue (partition)
+#SBATCH --mail-user=julialober@u.boisestate.edu
+#SBATCH --mail-type=END
+
 
 set -euo pipefail
 mkdir -p logs
 
 # ---- settings (must match the --init call) ----
-ZARRS="${ZARRS:-data/nisar/zarrs/track019/gunw_80m.zarr}"   # space-separated, one per track
-VAR="${VAR:-coherence_80m}"                                 # variable name inside the stores
-OUT="${OUT:-outputs/decay_80m.zarr}"
-EXTRA="${EXTRA:-}"                                          # e.g. "--start-date 2026-01-01 --end-date 2026-04-30"
+ZARRS="${ZARRS:-data/nisar/zarrs/all_pairs/track019/gunw_80m.zarr}"   # space-separated, one per track
+VAR="${VAR:-coherence}"                                 # variable name inside the stores
+OUT="${OUT:-data/nisar/zarrs/all_pairs/track019/decay_80m.zarr}"
+#EXTRA="${EXTRA:---start-date 2025-12-01 --end-date 2026-02-28 }"                                          # e.g. "--start-date 2026-01-01 --end-date 2026-04-30"
+EXTRA="${EXTRA:-}" 
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate coherence_v2
