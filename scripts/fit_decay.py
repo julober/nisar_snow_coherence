@@ -162,7 +162,7 @@ def main(argv=None):
     ap.add_argument('--tau-guess', type=float, default=6, help='starting tau, days (default: %(default)s)')
     ap.add_argument('--tau-bounds', nargs=2, type=float, default=[0, 30], metavar=('LO', 'HI'),
                     help='bounds on tau, days (default: %(default)s)')
-    ap.add_argument('--min-pairs', type=int, default=5, help='fewest valid pairs to fit a pixel (default: %(default)s)')
+    ap.add_argument('--min-pairs', type=int, default=10, help='fewest valid pairs to fit a pixel (default: %(default)s)')
     ap.add_argument('--tile-size', type=int, default=256, help='tile side, pixels (default: %(default)s)')
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
