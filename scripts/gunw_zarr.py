@@ -5,8 +5,8 @@ Reads the ``GUNW_product.h5`` files written by ``submit_gunw_pairs.sh`` (one per
 ``<gunw-root>/<ref>_<sec>_<ORBIT>/GUNW_product.h5``) and writes two Zarr stores per track, because the
 20 m and 80 m coherence layers are on different grids:
 
-    <out-dir>/track<TTT>/gunw_20m.zarr   variable ``coherence_20m``, dims (pair, y, x)
-    <out-dir>/track<TTT>/gunw_80m.zarr   variable ``coherence_80m``, dims (pair, y, x)
+    <out-dir>/track<TTT>/gunw_20m.zarr   variable ``coherence``, dims (pair, y, x)
+    <out-dir>/track<TTT>/gunw_80m.zarr   variable ``coherence``, dims (pair, y, x)
 
 Coordinates, identical in both stores:
     pair   'YYYYMMDD_YYYYMMDD' (local dates of the reference and secondary acquisitions)
@@ -45,13 +45,16 @@ from scripts.download import BASE_GRIDS, COORD_PATHS, LAYER_REGISTRY, _get_epsg 
 logger = logging.getLogger(__name__)
 # Zarr v3 warns that fixed-width strings (our `pair` ids) have no formal spec; they read back fine with xarray.
 warnings.filterwarnings('ignore', message='.*does not have a Zarr V3 specification.*')
+# Consolidated metadata is not in the Zarr v3 spec either, but xarray reads it (one file instead of many) and keeps
+# it current on append; only non-Python Zarr readers might ignore it.
+warnings.filterwarnings('ignore', message='.*Consolidated metadata is currently not part.*')
 
 POL = 'HH'
 IDENT = 'science/LSAR/identification'
 # Output store name -> (layer in LAYER_REGISTRY, variable name in the store).
 RESOLUTIONS = {
-    '20m': ('coherence_wrapped', 'coherence_20m'),
-    '80m': ('coherence_unwrapped', 'coherence_80m'),
+    '20m': ('coherence_wrapped', 'coherence'),
+    '80m': ('coherence_unwrapped', 'coherence'),
 }
 
 
@@ -115,7 +118,7 @@ def _existing_pairs(store: Path) -> Tuple[set, Optional[xr.Dataset]]:
     """Pair ids already in a store (empty set if it does not exist yet)."""
     if not store.exists():
         return set(), None
-    ds = xr.open_zarr(store, consolidated=False)
+    ds = xr.open_zarr(store)
     return set(ds['pair'].values.tolist()), ds
 
 
@@ -165,11 +168,11 @@ def build(files: List[Path], out_dir: Path, utc_offset_hours: float, max_days: O
             ds = _make_dataset(res, rows, utc_offset_hours)
             var = RESOLUTIONS[res][1]
             if store.exists():
-                ds.to_zarr(store, append_dim='pair', consolidated=False)
+                ds.to_zarr(store, append_dim='pair', consolidated=True)
             else:
                 ny, nx = ds[var].shape[1:]
                 ds[var].encoding['chunks'] = (batch_size, min(256, ny), min(256, nx))
-                ds.to_zarr(store, mode='w', consolidated=False)
+                ds.to_zarr(store, mode='w', consolidated=True)
             seen[res].update(b['pair'] for b in rows)
             logger.info(f'{store.name}: +{len(rows)} pairs (now {len(seen[res])})')
         batch.clear()
