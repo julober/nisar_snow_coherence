@@ -13,8 +13,9 @@ same x/y grid or the script stops. ``--var`` must be the name of the variable in
 The date window and ``--max-days`` are applied to every track: a pair is kept if its reference start is on or after
 ``--start-date``, its secondary start is on or before ``--end-date`` and (if given) it spans at most ``--max-days``.
 
-Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``tau_err``, ``gamma_inf_err``, ``n_pairs`` and
-``success``. Its chunks are the tiles, so array tasks never write the same chunk.
+Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``r2`` (R^2 of the fit), ``n_pairs`` and
+``success``. ``--metrics tau_err gamma_inf_err`` (either or both) adds the 1-sigma parameter errors. Its chunks are
+the tiles, so array tasks never write the same chunk.
 
 Steps the wrapper runs, to do by hand (use the same data/fit arguments for all three, they define which pairs are fit):
     python scripts/fit_decay.py --init --zarr A.zarr B.zarr --var coherence_80m --output out.zarr   # once, prints tiles
@@ -32,13 +33,17 @@ import xarray as xr
 
 # Allow `python scripts/fit_decay.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.taus import get_taus_spatial  # noqa: E402
+from scripts.taus import METRICS, get_taus_spatial  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # Output variable -> dtype; all are (y, x). NaN (or 0 / False) marks pixels that have not been fit.
-OUT_VARS = {'tau': 'float32', 'gamma_inf': 'float32', 'tau_err': 'float32', 'gamma_inf_err': 'float32',
-            'n_pairs': 'int16', 'success': 'bool'}
+OUT_VARS = {'tau': 'float32', 'gamma_inf': 'float32', 'r2': 'float32', 'n_pairs': 'int16', 'success': 'bool'}
+
+
+def out_vars(metrics) -> dict:
+    """``OUT_VARS`` plus the optional error maps asked for with --metrics."""
+    return {**OUT_VARS, **{m: 'float32' for m in metrics}}
 
 
 def select_pairs(ds: xr.Dataset, start_date, end_date, max_days) -> np.ndarray:
@@ -99,13 +104,14 @@ def init_output(a, days, grid) -> int:
     ny, nx = grid.sizes['y'], grid.sizes['x']
     fill = {'float32': np.nan, 'int16': 0, 'bool': False}
     data = {k: (('y', 'x'), da.full((ny, nx), fill[t], dtype=t, chunks=(a.tile_size, a.tile_size)))
-            for k, t in OUT_VARS.items()}
+            for k, t in out_vars(a.metrics).items()}
     out = xr.Dataset(data, coords={'y': grid['y'].values, 'x': grid['x'].values})
     out.attrs.update(
         crs=grid.attrs.get('crs', ''), var=a.var, n_pairs_fit=int(days.size), tile_size=a.tile_size,
         stores=[str(s) for s in a.zarr], start_date=str(a.start_date), end_date=str(a.end_date),
         max_days=str(a.max_days), gamma_inf='fit' if a.gamma_inf is None else a.gamma_inf,
         tau_guess=a.tau_guess, tau_bounds=list(a.tau_bounds), min_pairs=a.min_pairs,
+        metrics=list(a.metrics),
     )
     out.to_zarr(a.output, mode='w', compute=False, consolidated=True)
     return n_tiles(ny, nx, a.tile_size)
@@ -127,9 +133,9 @@ def fit_tile(a) -> None:
     logger.info(f'tile {a.tile_index}/{total - 1}: y {ys.start}:{ys.stop}, x {xs.start}:{xs.stop}, '
                 f'{block.shape[0]} pairs')
     res = get_taus_spatial(block, days, tau_guess=a.tau_guess, tau_bounds=tuple(a.tau_bounds),
-                           gamma_inf=a.gamma_inf, min_pairs=a.min_pairs)
+                           gamma_inf=a.gamma_inf, min_pairs=a.min_pairs, metrics=a.metrics)
     # Only data variables, no coords: a region write must not carry the full y/x index.
-    xr.Dataset({k: (('y', 'x'), res[k]) for k in OUT_VARS}).to_zarr(
+    xr.Dataset({k: (('y', 'x'), res[k]) for k in out_vars(a.metrics)}).to_zarr(
         a.output, region={'y': ys, 'x': xs}, consolidated=True)
     logger.info(f'tile {a.tile_index}: fit {int(res["success"].sum())} of {res["success"].size} pixels')
 
@@ -141,10 +147,11 @@ def finalize(output: Path) -> None:
     ds = ds.rio.write_crs(ds.attrs['crs'])
     out_dir = output.with_name(output.stem + '_tifs')
     out_dir.mkdir(exist_ok=True)
-    for k in OUT_VARS:
+    # Every variable in the Zarr, so the --metrics chosen at --init need not be repeated here.
+    for k in ds.data_vars:
         da = ds[k].astype('uint8') if k == 'success' else ds[k]  # GeoTIFF has no bool type
         da.rio.to_raster(out_dir / f'{k}.tif')
-    logger.info(f'wrote {len(OUT_VARS)} GeoTIFFs to {out_dir}')
+    logger.info(f'wrote {len(ds.data_vars)} GeoTIFFs to {out_dir}')
 
 
 def main(argv=None):
@@ -163,6 +170,9 @@ def main(argv=None):
     ap.add_argument('--max-days', type=float, default=None, help='keep pairs up to this many days apart')
     ap.add_argument('--gamma-inf', type=float, default=None,
                     help='fix gamma_inf at this value (default: fit it per pixel)')
+    ap.add_argument('--metrics', nargs='*', choices=METRICS, default=[],
+                    help='extra output maps: the 1-sigma errors of tau and/or gamma_inf (default: none, R^2 only). '
+                         'Give the same value at --init and for every tile.')
     ap.add_argument('--tau-guess', type=float, default=6, help='starting tau, days (default: %(default)s)')
     ap.add_argument('--tau-bounds', nargs=2, type=float, default=[0, 30], metavar=('LO', 'HI'),
                     help='bounds on tau, days (default: %(default)s)')
