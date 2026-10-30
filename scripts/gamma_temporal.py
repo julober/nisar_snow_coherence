@@ -6,8 +6,10 @@ so a large stack of pairs does not have to fit in memory. This is the script ver
 Inputs (``<data-dir>`` is ``data`` by default, ``TTT``/``FFF`` are the zero-padded track and frame):
     <zarr-dir>/gunw_80m.zarr, gunw_20m.zarr   cubes (pair, y, x) with ``coherence`` and ``coherence_true`` (notebook 1);
                                               the 80 m cube also needs ``elevation`` (the DEM for the radar grid)
-    <data-dir>/nisar/east_river/trackTTT_frameFFF/   backscatter, NEBZ, incidence angle, perpendicular baseline and
-                                              reference slant range GeoTIFFs
+    <data-dir>/nisar/east_river/trackTTT_frameFFF/   backscatter and NEBZ GeoTIFFs (for the SNR)
+    <gunw-root>/TTT_<A|D>_FFF/<ref>-<sec>_POE/GUNW_product.h5   the GUNWs made by submit_gunw_pairs.sh; the incidence
+                                              angle, perpendicular baseline and reference slant range come from their
+                                              metadata/radarGrid group, and the pair of each file from its times
     --aso <tif>                               optional, masks the cubes to the footprint of this raster
 
 Outputs, in ``<out-dir>`` (default: ``<zarr-dir>``, which is ``<data-dir>/nisar/zarrs/all_pairs/trackTTT``):
@@ -18,13 +20,14 @@ Outputs, in ``<out-dir>`` (default: ``<zarr-dir>``, which is ``<data-dir>/nisar/
                                               next acquisition after its reference) for each of ``--tif-vars``
 
 How the work is split: pairs are processed in batches of ``--pair-chunk``. For each batch only the SNR files of the
-dates it needs and the radar-grid files of its pairs are opened, so memory use is set by the batch size and the number
+dates it needs and the GUNW files of its pairs are opened, so memory use is set by the batch size and the number
 of workers (peak is roughly ``--n-workers`` batches at once). Each batch writes its own slice of the output Zarr,
 which is stored in ``(pair-chunk, tile, tile)`` chunks so the next step can read one spatial tile for all pairs
 without touching every pixel.
 
 Example, from the repo root (on the cluster use scripts/slurm/gamma_temporal.sbatch):
-    python scripts/gamma_temporal.py --track 19 --frame 21 --aso data/aso/er_20260318/ASO_EastRiver_2026Mar18_snowdepth_3m.tif
+    python scripts/gamma_temporal.py --track 19 --frame 21 --gunw-root /path/to/stacks \
+        --aso data/aso/er_20260318/ASO_EastRiver_2026Mar18_snowdepth_3m.tif
 """
 import argparse
 import logging
@@ -37,15 +40,21 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import dask
+import h5py
 import numpy as np
 import xarray as xr
 import rioxarray  # noqa: F401
+from pyproj import Transformer
 from rasterio.enums import Resampling
 
 # Allow `python scripts/gamma_temporal.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.coherence import spatial_coherence  # noqa: E402
-from scripts.download import _match_gslc_files, build_snr_timeseries, interpolate_radar_grid_to_dem, parse_times  # noqa: E402
+from scripts.download import (  # noqa: E402
+    BASE_META, _interp_radar_grid, _match_gslc_files, _read_coords, _read_radar_grid_layer, build_snr_timeseries,
+    parse_times,
+)
+from scripts.gunw_zarr import IDENT, POL, _local_time  # noqa: E402
 
 logger = logging.getLogger(__name__)
 # Zarr v3 warns that fixed-width strings (our `pair` ids) have no formal spec; they read back fine with xarray.
@@ -53,9 +62,9 @@ warnings.filterwarnings('ignore', message='.*does not have a Zarr V3 specificati
 
 # Variables written on top of the ones in the input cubes. All are (pair, y, x).
 GAMMA_VARS = ['gamma_thermal', 'gamma_spatial', 'gamma_temporal_uncorrected', 'gamma_temporal']
-# Radar-grid layer -> glob used to find its files in the track/frame folder.
-RADAR_GRID_GLOBS = {'incidence': '*incidence_angle*', 'baseline': '*perpendicular_baseline*',
-                    'range': '*reference_slant_range*'}
+# Radar-grid layer -> its dataset in the GUNW's metadata/radarGrid group.
+RADAR_GRID_LAYERS = {'incidence': 'incidenceAngle', 'baseline': 'perpendicularBaseline',
+                     'range': 'referenceSlantRange'}
 DIMS = ('pair', 'y', 'x')
 
 
@@ -72,14 +81,14 @@ class Job:
     acq_times: np.ndarray            # datetime64[ns] of each GSLC acquisition that has backscatter and NEBZ
     bs_files: List[Path]             # same order as acq_times
     nebz_files: List[Path]
-    radar_files: Dict[str, Dict[str, Path]]   # layer -> pair id -> file
+    gunw_files: Dict[str, Path]      # pair id -> GUNW_product.h5 (the radar-grid layers are read from it)
     dem: xr.DataArray                # masked 80 m elevation with a CRS
     masks: Dict[str, Optional[np.ndarray]]    # resolution -> bool (y, x) ASO footprint, None for no mask
     templates: Dict[str, xr.DataArray]        # resolution -> empty (y, x) array with the grid and CRS of the cube
     utc_offset: float
     spatial_res: float
     wavelength: float
-    incidence_degrees: bool
+    incidence_to_radians: bool       # the GUNW incidence angle is in degrees
     tif_vars: List[str]
     pair_chunk: int
 
@@ -88,15 +97,36 @@ def find_files(folder: Path, pattern: str) -> List[Path]:
     return sorted(item.resolve() for item in folder.rglob(pattern))
 
 
-def index_by_pair(files: List[Path], utc_offset: float) -> Dict[str, Path]:
-    """``'YYYYMMDD_YYYYMMDD'`` -> file, keeping the first file (sorted by name) of a duplicated pair."""
+def find_gunws(gunw_root: Path, track: int, frame: int, orbit: str) -> List[Path]:
+    """
+    GUNW files of one track and frame: ``<gunw-root>/<TTT>_<A|D>_<FFF>/**/<ref>-<sec>_<ORBIT>/GUNW_product.h5``. The
+    levels between the stack folder and the pair folder (such as ``gunw/``) do not matter.
+    """
+    stacks = sorted(gunw_root.glob(f'{track:03d}_[AD]_{frame:03d}'))
+    if len(stacks) != 1:
+        sys.exit(f'expected one {track:03d}_<A|D>_{frame:03d} folder in {gunw_root}, found {[s.name for s in stacks]}')
+    return sorted(f for f in stacks[0].rglob('GUNW_product.h5') if f.parent.name.upper().endswith(f'_{orbit.upper()}'))
+
+
+def index_gunws(files: List[Path], utc_offset: float) -> Dict[str, Path]:
+    """
+    ``'YYYYMMDD_YYYYMMDD'`` -> GUNW file. The pair id comes from the reference and secondary start times stored in the
+    file (as ``gunw_zarr.py`` makes it), not from the folder name, whose dates may be UTC dates.
+    """
     out = {}
-    for f in sorted(files):
+    for f in files:
         try:
-            start, end = parse_times(f, utc_offset)
-        except ValueError:
+            with h5py.File(f, 'r') as hf:
+                start = _local_time(hf[f'{IDENT}/referenceZeroDopplerStartTime'][()], utc_offset)
+                end = _local_time(hf[f'{IDENT}/secondaryZeroDopplerStartTime'][()], utc_offset)
+        except (OSError, KeyError) as err:
+            logger.warning(f'cannot read the times of {f}: {err}')
             continue
-        out.setdefault(f'{start:%Y%m%d}_{end:%Y%m%d}', f)
+        pair = f"{str(start)[:10].replace('-', '')}_{str(end)[:10].replace('-', '')}"
+        if pair in out:
+            logger.warning(f'{pair} is in both {out[pair]} and {f}; using the first')
+        else:
+            out[pair] = f
     return out
 
 
@@ -137,23 +167,55 @@ def batch_thermal(job: Job, starts: np.ndarray, ends: np.ndarray, pairs: List[st
     return gamma.transpose(*DIMS).rio.write_crs(snr.rio.crs)
 
 
+def dem_points(dem: xr.DataArray, epsg: int):
+    """x and y of every DEM pixel in the CRS of the radar grid."""
+    xx, yy = np.meshgrid(dem['x'].values, dem['y'].values)
+    if dem.rio.crs == f'EPSG:{epsg}':
+        return xx, yy
+    return Transformer.from_crs(dem.rio.crs, f'EPSG:{epsg}', always_xy=True).transform(xx, yy)
+
+
+def interpolate_gunw_layers(dem: xr.DataArray, files: List[Path], pairs: List[str]) -> Dict[str, xr.DataArray]:
+    """
+    Incidence angle, perpendicular baseline and reference slant range of the GUNWs ``files`` (one per pair),
+    interpolated onto the DEM pixels: linearly in x/y, then linearly in height at the DEM elevation, as
+    ``download.interpolate_radar_grid_to_dem`` does for the GeoTIFFs written by ``download_nisar``. Returns one
+    ``(pair, y, x)`` array per layer in ``RADAR_GRID_LAYERS``.
+    """
+    z = dem.values.astype(np.float64)
+    points = {}  # radar-grid EPSG -> (x, y) of the DEM pixels
+    out = {name: [] for name in RADAR_GRID_LAYERS}
+    for f in files:
+        with h5py.File(f, 'r') as hf:
+            epsg = int(hf[f'{BASE_META}/radarGrid/projection'][()])
+            x, y = _read_coords(hf, 'metadata', POL)
+            layers = {name: _read_radar_grid_layer(hf, dataset, name, x, y, epsg)
+                      for name, dataset in RADAR_GRID_LAYERS.items()}
+        if epsg not in points:
+            points[epsg] = dem_points(dem, epsg)
+        for name, layer in layers.items():
+            layer = layer.sortby('band').sortby('y')  # the interpolator needs ascending heights and y
+            out[name].append(_interp_radar_grid(
+                layer.values.astype(np.float64), layer['band'].values, layer['y'].values, layer['x'].values,
+                *points[epsg], z, dtype=layer.dtype))
+    coords = {'pair': pairs, 'y': dem['y'].values, 'x': dem['x'].values}
+    return {name: xr.DataArray(np.stack(arrays), dims=DIMS, coords=coords) for name, arrays in out.items()}
+
+
 def batch_spatial(job: Job, pairs: List[str]) -> xr.DataArray:
     """
-    gamma_spatial on the 80 m DEM grid for a batch of pairs. Only the radar-grid files of these pairs are opened.
-    Pairs missing one of the three layers are NaN.
+    gamma_spatial on the 80 m DEM grid for a batch of pairs. Only the GUNW files of these pairs are opened.
+    Pairs without a GUNW are NaN.
     """
-    have = [p for p in pairs if all(p in files for files in job.radar_files.values())]
+    have = [p for p in pairs if p in job.gunw_files]
     gamma = xr.DataArray(np.full((len(pairs), job.dem.sizes['y'], job.dem.sizes['x']), np.nan), dims=DIMS,
                          coords={'pair': pairs, 'y': job.dem['y'].values, 'x': job.dem['x'].values})
-    # NaN is declared nodata, as in interpolate_radar_grid_to_dem, so the bilinear reprojection skips NaN neighbours
+    # NaN is declared nodata, as in the notebook, so the bilinear reprojection skips NaN neighbours
     gamma = gamma.rio.write_crs(job.dem.rio.crs).rio.write_nodata(np.nan)
     if not have:
         return gamma
-    layers = {}
-    for name, files in job.radar_files.items():
-        da = interpolate_radar_grid_to_dem(job.dem, [files[p] for p in have], utc_offset_hours=job.utc_offset)
-        layers[name] = da if 'pair' in da.dims else da.expand_dims(pair=have)  # one file gives no pair dimension
-    theta = np.deg2rad(layers['incidence']) if job.incidence_degrees else layers['incidence']
+    layers = interpolate_gunw_layers(job.dem, [job.gunw_files[p] for p in have], have)
+    theta = np.deg2rad(layers['incidence']) if job.incidence_to_radians else layers['incidence']
     result = spatial_coherence(layers['baseline'], theta, layers['range'], job.spatial_res, job.wavelength)
     gamma.loc[{'pair': have}] = result.transpose(*DIMS).values
     return gamma
@@ -226,7 +288,7 @@ def init_output(job: Job, res: str, cube: xr.Dataset, args) -> None:
         data[name] = xr.zeros_like(cube['coherence'], dtype='float32').chunk(chunks)
     out = xr.Dataset(data, coords=cube.coords, attrs=cube.attrs)
     out.attrs.update(utc_offset_hours=job.utc_offset, spatial_res=job.spatial_res, wavelength=job.wavelength,
-                     incidence_degrees=int(job.incidence_degrees), aso=str(args.aso))
+                     incidence_to_radians=int(job.incidence_to_radians), aso=str(args.aso))
     for var in out.variables.values():  # the chunks of the input store must not override the new ones
         for key in ('chunks', 'preferred_chunks', 'shards'):
             var.encoding.pop(key, None)
@@ -242,15 +304,18 @@ def main(argv=None):
     ap.add_argument('--zarr-dir', type=Path, default=None,
                     help='folder with gunw_<res>.zarr (default: <data-dir>/nisar/zarrs/all_pairs/track<TTT>)')
     ap.add_argument('--out-dir', type=Path, default=None, help='output folder (default: --zarr-dir)')
+    ap.add_argument('--gunw-root', required=True, type=Path,
+                    help='folder holding <TTT>_<A|D>_<FFF>/<ref>-<sec>_<ORBIT>/GUNW_product.h5')
+    ap.add_argument('--orbit', default='poe', help='orbit type of the GUNW folders, poe or moe (default: %(default)s)')
     ap.add_argument('--aso', type=Path, default=None, help='raster whose footprint masks the cubes (default: no mask)')
     ap.add_argument('--resolutions', nargs='+', choices=['80m', '20m'], default=['80m', '20m'])
     ap.add_argument('--utc-offset', type=float, default=-7, help='hours from UTC, no DST (default: %(default)s)')
     ap.add_argument('--spatial-res', type=float, default=3,
                     help='resolution (m) in the spatial-baseline term, about the GSLC resolution (default: %(default)s)')
     ap.add_argument('--wavelength', type=float, default=0.24, help='radar wavelength, m (default: %(default)s)')
-    ap.add_argument('--incidence-degrees', action='store_true',
-                    help='convert the incidence angle layer from degrees to radians before gamma_spatial. Off by '
-                         'default, which is what notebook 2 does')
+    ap.add_argument('--no-incidence-conversion', action='store_true',
+                    help='use the incidence angle as stored (degrees) in gamma_spatial instead of converting it to '
+                         'radians, which is what notebook 2 does')
     ap.add_argument('--tif-vars', nargs='+', choices=GAMMA_VARS, default=['gamma_temporal'],
                     help='variables exported as GeoTIFFs for the nearest-neighbour pairs (default: %(default)s)')
     ap.add_argument('--pair-chunk', type=int, default=20, help='pairs per batch (default: %(default)s)')
@@ -289,21 +354,23 @@ def main(argv=None):
         sys.exit(f'no matching backscatter / NEBZ files in {scene_dir}')
     acquisitions = sorted((np.datetime64(parse_times(scene, args.utc_offset)[0], 'ns'), bs, nz)
                           for scene, bs, nz in matched)
-    radar_files = {name: index_by_pair(find_files(scene_dir, pattern), args.utc_offset)
-                   for name, pattern in RADAR_GRID_GLOBS.items()}
-    logger.info(f'{len(pairs)} pairs, {len(acquisitions)} acquisitions with SNR, radar-grid files per layer: '
-                f'{ {k: len(v) for k, v in radar_files.items()} }')
-    no_radar = [p for p in pairs if not all(p in files for files in radar_files.values())]
+    gunw_files = index_gunws(find_gunws(args.gunw_root, args.track, args.frame, args.orbit), args.utc_offset)
+    logger.info(f'{len(pairs)} pairs, {len(acquisitions)} acquisitions with SNR, {len(gunw_files)} GUNW files')
+    no_radar = [p for p in pairs if p not in gunw_files]
     if no_radar:
-        logger.warning(f'{len(no_radar)} pairs have no radar-grid files and get NaN gamma_spatial: {no_radar}')
+        logger.warning(f'{len(no_radar)} pairs have no GUNW file and get NaN gamma_spatial: {no_radar}')
     if len(no_radar) == len(pairs):
-        sys.exit('none of the pairs has radar-grid files')
+        sys.exit(f'none of the pairs has a GUNW file under {args.gunw_root}')
 
     # ASO footprint on each grid, as in the notebook (the raster has a length-1 band dimension)
     templates = {res: grid_template(cube) for res, cube in cubes.items()}
     masks = {res: None for res in cubes}
     if args.aso is not None:
-        aso = xr.open_dataarray(args.aso).squeeze('band', drop=True)
+        if not args.aso.exists():
+            sys.exit(f'--aso {args.aso} does not exist')
+        # open_rasterio with a str, not xr.open_dataarray(Path): that depends on xarray guessing the backend, which
+        # fails with some rioxarray versions
+        aso = rioxarray.open_rasterio(str(args.aso)).squeeze('band', drop=True)
         masks = {res: aso.rio.reproject_match(t).notnull().values for res, t in templates.items()}
     dem = cube80['elevation'].load()
     if masks['80m'] is not None:
@@ -314,9 +381,9 @@ def main(argv=None):
         zarr_dir=zarr_dir, out_dir=out_dir, resolutions=resolutions, pairs=pairs, starts=starts, ends=ends,
         nearest_neighbor=nearest_neighbor_pairs(starts, ends),
         acq_times=np.array([a[0] for a in acquisitions]), bs_files=[a[1] for a in acquisitions],
-        nebz_files=[a[2] for a in acquisitions], radar_files=radar_files, dem=dem, masks=masks, templates=templates,
+        nebz_files=[a[2] for a in acquisitions], gunw_files=gunw_files, dem=dem, masks=masks, templates=templates,
         utc_offset=args.utc_offset, spatial_res=args.spatial_res, wavelength=args.wavelength,
-        incidence_degrees=args.incidence_degrees, tif_vars=args.tif_vars, pair_chunk=args.pair_chunk,
+        incidence_to_radians=not args.no_incidence_conversion, tif_vars=args.tif_vars, pair_chunk=args.pair_chunk,
     )
     logger.info(f'{int(job.nearest_neighbor.sum())} nearest-neighbour pairs get GeoTIFFs of {args.tif_vars}')
 
