@@ -9,7 +9,8 @@ Inputs (``<data-dir>`` is ``data`` by default, ``TTT``/``FFF`` are the zero-padd
     <data-dir>/nisar/east_river/trackTTT_frameFFF/   backscatter and NEBZ GeoTIFFs (for the SNR)
     <gunw-root>/TTT_<A|D>_FFF/<ref>-<sec>_POE/GUNW_product.h5   the GUNWs made by submit_gunw_pairs.sh; the incidence
                                               angle, perpendicular baseline and reference slant range come from their
-                                              metadata/radarGrid group, and the pair of each file from its times
+                                              metadata/radarGrid group, and the pair of each file from its times. The
+                                              baseline is reduced to its mean over the DEM pixels (one value per pair)
     --aso <tif>                               optional, masks the cubes to the footprint of this raster
 
 Outputs, in ``<out-dir>`` (default: ``<zarr-dir>``, which is ``<data-dir>/nisar/zarrs/all_pairs/trackTTT``):
@@ -181,6 +182,10 @@ def interpolate_gunw_layers(dem: xr.DataArray, files: List[Path], pairs: List[st
     interpolated onto the DEM pixels: linearly in x/y, then linearly in height at the DEM elevation, as
     ``download.interpolate_radar_grid_to_dem`` does for the GeoTIFFs written by ``download_nisar``. Returns one
     ``(pair, y, x)`` array per layer in ``RADAR_GRID_LAYERS``.
+
+    The exception is the baseline: after interpolation it is replaced, for each pair, by the mean of its valid pixels
+    (constant over the DEM footprint), because the GUNW baseline is empty over part of the radar grid. A pair with no
+    valid baseline pixel is NaN and is logged.
     """
     z = dem.values.astype(np.float64)
     points = {}  # radar-grid EPSG -> (x, y) of the DEM pixels
@@ -199,13 +204,26 @@ def interpolate_gunw_layers(dem: xr.DataArray, files: List[Path], pairs: List[st
                 layer.values.astype(np.float64), layer['band'].values, layer['y'].values, layer['x'].values,
                 *points[epsg], z, dtype=layer.dtype))
     coords = {'pair': pairs, 'y': dem['y'].values, 'x': dem['x'].values}
-    return {name: xr.DataArray(np.stack(arrays), dims=DIMS, coords=coords) for name, arrays in out.items()}
+    layers = {name: xr.DataArray(np.stack(arrays), dims=DIMS, coords=coords) for name, arrays in out.items()}
+
+    # The baseline hardly varies across the scene and the GUNW leaves part of its radar grid empty, so a single value
+    # per pair (the mean of the interpolated pixels that have a baseline) is used everywhere the DEM is valid.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)  # mean of an all-NaN slice
+        mean_baseline = layers['baseline'].mean(['y', 'x'], skipna=True)
+    no_baseline = [p for p, m in zip(pairs, mean_baseline.values) if np.isnan(m)]
+    if no_baseline:
+        logger.warning(f'{len(no_baseline)} pairs have no valid perpendicular baseline and get NaN gamma_spatial: '
+                       f'{no_baseline}')
+    # Keep the DEM footprint: incidence is NaN wherever the DEM is NaN
+    layers['baseline'] = (mean_baseline + xr.zeros_like(layers['baseline'])).where(layers['incidence'].notnull())
+    return layers
 
 
 def batch_spatial(job: Job, pairs: List[str]) -> xr.DataArray:
     """
     gamma_spatial on the 80 m DEM grid for a batch of pairs. Only the GUNW files of these pairs are opened.
-    Pairs without a GUNW are NaN.
+    Pairs without a GUNW are NaN. The baseline is one value per pair (see ``interpolate_gunw_layers``).
     """
     have = [p for p in pairs if p in job.gunw_files]
     gamma = xr.DataArray(np.full((len(pairs), job.dem.sizes['y'], job.dem.sizes['x']), np.nan), dims=DIMS,
