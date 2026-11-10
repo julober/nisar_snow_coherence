@@ -13,9 +13,17 @@ same x/y grid or the script stops. ``--var`` must be the name of the variable in
 The date window and ``--max-days`` are applied to every track: a pair is kept if its reference start is on or after
 ``--start-date``, its secondary start is on or before ``--end-date`` and (if given) it spans at most ``--max-days``.
 
-Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``r2`` (R^2 of the fit), ``n_pairs`` and
-``success``. ``--metrics tau_err gamma_inf_err`` (either or both) adds the 1-sigma parameter errors. Its chunks are
-the tiles, so array tasks never write the same chunk.
+Snow model: with ``--swe-zarr`` (one store per track, same order as ``--zarr``), ``--swe-var`` and ``--inc-tif`` the
+snow decay model is fit instead (``taus.decorrelation_temporal_model_snow``). The swe stores need a (pair, y, x)
+variable with ``start`` / ``end`` coords on the same x/y grid; its pairs are matched to the coherence pairs by their
+dates. ``--inc-tif`` is the local incidence angle in DEGREES on the same grid (e.g. from ``scripts/lia.py``).
+
+gamma_0 is fixed at 1 unless you pass ``--gamma-0 <value>`` (another fixed value) or ``--fit-gamma-0`` (fit it).
+
+Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``gamma_0``, ``nse``, ``kge`` and ``pearson_r`` (the
+goodness of fit), ``n_pairs`` and ``success``, plus ``kappa`` for the snow model. ``--metrics`` (any of tau_err
+gamma_inf_err gamma_0_err kappa_err) adds the 1-sigma parameter errors. Its chunks are the tiles, so array tasks never
+write the same chunk.
 
 Steps the wrapper runs, to do by hand (use the same data/fit arguments for all three, they define which pairs are fit):
     python scripts/fit_decay.py --init --zarr A.zarr B.zarr --var coherence_80m --output out.zarr   # once, prints tiles
@@ -33,17 +41,27 @@ import xarray as xr
 
 # Allow `python scripts/fit_decay.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.taus import METRICS, get_taus_spatial  # noqa: E402
+from scripts.taus import BASE_MAPS, KAPPA_GUESS, METRICS, get_taus_spatial  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # Output variable -> dtype; all are (y, x). NaN (or 0 / False) marks pixels that have not been fit.
-OUT_VARS = {'tau': 'float32', 'gamma_inf': 'float32', 'r2': 'float32', 'n_pairs': 'int16', 'success': 'bool'}
+OUT_VARS = {**{k: 'float32' for k in BASE_MAPS}, 'n_pairs': 'int16', 'success': 'bool'}
 
 
-def out_vars(metrics) -> dict:
-    """``OUT_VARS`` plus the optional error maps asked for with --metrics."""
-    return {**OUT_VARS, **{m: 'float32' for m in metrics}}
+def is_snow(a) -> bool:
+    """True if the snow model was asked for (--swe-zarr)."""
+    return bool(a.swe_zarr)
+
+
+def out_vars(a) -> dict:
+    """``OUT_VARS`` plus ``kappa`` (snow model) and the optional error maps asked for with --metrics."""
+    return {**OUT_VARS, **({'kappa': 'float32'} if is_snow(a) else {}), **{m: 'float32' for m in a.metrics}}
+
+
+def gamma_0_value(a):
+    """The gamma_0 passed to the fit: None (fit it) with --fit-gamma-0, else the fixed value."""
+    return None if a.fit_gamma_0 else a.gamma_0
 
 
 def select_pairs(ds: xr.Dataset, start_date, end_date, max_days) -> np.ndarray:
@@ -60,31 +78,63 @@ def select_pairs(ds: xr.Dataset, start_date, end_date, max_days) -> np.ndarray:
     return np.flatnonzero(keep)
 
 
-def open_tracks(stores: List[Path], var: str, start_date, end_date, max_days):
+def same_grid(ds: xr.Dataset, ref: xr.Dataset) -> bool:
+    return (ds['x'].shape == ref['x'].shape and ds['y'].shape == ref['y'].shape
+            and np.array_equal(ds['x'].values, ref['x'].values) and np.array_equal(ds['y'].values, ref['y'].values))
+
+
+def match_pairs(swe_ds: xr.Dataset, swe_var: str, start, end, store) -> xr.DataArray:
+    """The ``swe_var`` pairs of ``swe_ds`` that have the given (start, end) dates, in that order. Raises if any is missing."""
+    if swe_var not in swe_ds:
+        raise KeyError(f'{store} has no variable {swe_var!r}; it has {list(swe_ds.data_vars)}')
+    key = {(s, e): i for i, (s, e) in enumerate(zip(swe_ds['start'].values, swe_ds['end'].values))}
+    missing = [(s, e) for s, e in zip(start, end) if (s, e) not in key]
+    if missing:
+        raise ValueError(f'{store} has no swe for {len(missing)} selected pairs, e.g. {missing[0]}')
+    return swe_ds[swe_var].isel(pair=[key[(s, e)] for s, e in zip(start, end)])
+
+
+def open_tracks(stores: List[Path], var: str, start_date, end_date, max_days,
+                swe_stores: Optional[List[Path]] = None, swe_var: Optional[str] = None):
     """
-    Open the stores lazily and select pairs. Returns ``(das, days, grid)``: one lazy (pair, y, x) DataArray per
-    track (pairs already selected), the temporal baseline in days of all selected pairs (tracks in order), and the
-    first store's dataset (for x, y, crs).
+    Open the stores lazily and select pairs. Returns ``(das, days, grid, swe_das)``: one lazy (pair, y, x) DataArray
+    per track (pairs already selected), the temporal baseline in days of all selected pairs (tracks in order), the
+    first store's dataset (for x, y, crs), and, if ``swe_stores`` is given, the swe DataArrays of the same pairs in
+    the same order (otherwise None).
     """
-    das, days, first = [], [], None
-    for store in stores:
+    if swe_stores is not None and len(swe_stores) != len(stores):
+        raise ValueError(f'{len(swe_stores)} --swe-zarr stores for {len(stores)} --zarr stores: need one per track')
+    das, days, first, swe_das = [], [], None, ([] if swe_stores is not None else None)
+    for k, store in enumerate(stores):
         ds = xr.open_zarr(store)
         if var not in ds:
             raise KeyError(f'{store} has no variable {var!r}; it has {list(ds.data_vars)}')
         if first is None:
             first = ds
-        elif not (ds['x'].shape == first['x'].shape and ds['y'].shape == first['y'].shape
-                  and np.array_equal(ds['x'].values, first['x'].values)
-                  and np.array_equal(ds['y'].values, first['y'].values)):
+        elif not same_grid(ds, first):
             raise ValueError(f'{store} is not on the same x/y grid as {stores[0]}')
         idx = select_pairs(ds, start_date, end_date, max_days)
         logger.info(f'{store}: {len(idx)} of {ds.sizes["pair"]} pairs selected')
         das.append(ds[var].isel(pair=idx))
+        if swe_stores is not None:
+            swe_ds = xr.open_zarr(swe_stores[k])
+            if not same_grid(swe_ds, first):
+                raise ValueError(f'{swe_stores[k]} is not on the same x/y grid as {stores[0]}')
+            swe_das.append(match_pairs(swe_ds, swe_var, ds['start'].values[idx], ds['end'].values[idx], swe_stores[k]))
         days.append(((ds['end'].values - ds['start'].values) / np.timedelta64(1, 'D'))[idx])
     days = np.concatenate(days)
     if days.size == 0:
         raise ValueError('no pairs left after the date / max-days selection')
-    return das, days, first
+    return das, days, first, swe_das
+
+
+def load_inc(path: Path, grid: xr.Dataset) -> np.ndarray:
+    """Local incidence angle (degrees) from a GeoTIFF as a (y, x) array; it must be on the grid of the stores."""
+    import rioxarray  # noqa: F401
+    inc = xr.open_dataarray(path, engine='rasterio').squeeze(drop=True)
+    if inc.dims != ('y', 'x') or not same_grid(inc.to_dataset(name='inc'), grid):
+        raise ValueError(f'{path} is not a single-band raster on the same x/y grid as the stores')
+    return inc.values.astype('float64')
 
 
 def n_tiles(ny: int, nx: int, tile: int) -> int:
@@ -104,38 +154,53 @@ def init_output(a, days, grid) -> int:
     ny, nx = grid.sizes['y'], grid.sizes['x']
     fill = {'float32': np.nan, 'int16': 0, 'bool': False}
     data = {k: (('y', 'x'), da.full((ny, nx), fill[t], dtype=t, chunks=(a.tile_size, a.tile_size)))
-            for k, t in out_vars(a.metrics).items()}
+            for k, t in out_vars(a).items()}
     out = xr.Dataset(data, coords={'y': grid['y'].values, 'x': grid['x'].values})
     out.attrs.update(
         crs=grid.attrs.get('crs', ''), var=a.var, n_pairs_fit=int(days.size), tile_size=a.tile_size,
         stores=[str(s) for s in a.zarr], start_date=str(a.start_date), end_date=str(a.end_date),
         max_days=str(a.max_days), gamma_inf='fit' if a.gamma_inf is None else a.gamma_inf,
+        gamma_0='fit' if a.fit_gamma_0 else a.gamma_0, model='snow' if is_snow(a) else 'decay',
         tau_guess=a.tau_guess, tau_bounds=list(a.tau_bounds), min_pairs=a.min_pairs,
         metrics=list(a.metrics),
     )
+    if is_snow(a):
+        out.attrs.update(swe_var=a.swe_var, swe_stores=[str(s) for s in a.swe_zarr], inc_tif=str(a.inc_tif),
+                         kappa_guess=a.kappa_guess, kappa_bounds=list(a.kappa_bounds))
     out.to_zarr(a.output, mode='w', compute=False, consolidated=True)
     return n_tiles(ny, nx, a.tile_size)
 
 
 def fit_tile(a) -> None:
     """Fit tile ``a.tile_index`` and write it into its region of the output Zarr."""
-    das, days, grid = open_tracks(a.zarr, a.var, a.start_date, a.end_date, a.max_days)
+    das, days, grid, swe_das = open_tracks(a.zarr, a.var, a.start_date, a.end_date, a.max_days,
+                                           a.swe_zarr, a.swe_var)
     ny, nx = grid.sizes['y'], grid.sizes['x']
     total = n_tiles(ny, nx, a.tile_size)
     if not 0 <= a.tile_index < total:
         sys.exit(f'--tile-index {a.tile_index} is outside 0..{total - 1}')
-    expected = xr.open_zarr(a.output).attrs.get('n_pairs_fit')
-    if expected != days.size:  # a different pair set than at --init would give maps that mix two selections
-        sys.exit(f'{days.size} pairs selected now but {expected} at --init; use the same arguments as --init')
+    attrs = xr.open_zarr(a.output).attrs
+    if attrs.get('n_pairs_fit') != days.size:  # a different pair set than at --init would mix two selections
+        sys.exit(f'{days.size} pairs selected now but {attrs.get("n_pairs_fit")} at --init; '
+                 'use the same arguments as --init')
+    if attrs.get('model') != ('snow' if is_snow(a) else 'decay'):  # likewise a different model
+        sys.exit(f'this run is the {"snow" if is_snow(a) else "decay"} model but the output was made with '
+                 f'{attrs.get("model")!r} at --init; use the same arguments as --init')
 
     ys, xs = tile_slices(a.tile_index, ny, nx, a.tile_size)
     block = np.concatenate([da.isel(y=ys, x=xs).values for da in das], axis=0)
     logger.info(f'tile {a.tile_index}/{total - 1}: y {ys.start}:{ys.stop}, x {xs.start}:{xs.stop}, '
                 f'{block.shape[0]} pairs')
+    swe_block = inc_block = None
+    if is_snow(a):
+        swe_block = np.concatenate([da.isel(y=ys, x=xs).values for da in swe_das], axis=0)
+        inc_block = load_inc(a.inc_tif, grid)[ys, xs]
     res = get_taus_spatial(block, days, tau_guess=a.tau_guess, tau_bounds=tuple(a.tau_bounds),
-                           gamma_inf=a.gamma_inf, min_pairs=a.min_pairs, metrics=a.metrics)
+                           gamma_0=gamma_0_value(a), gamma_inf=a.gamma_inf, min_pairs=a.min_pairs,
+                           metrics=a.metrics, swe_arr=swe_block, inc=inc_block, kappa_guess=a.kappa_guess,
+                           kappa_bounds=tuple(a.kappa_bounds))
     # Only data variables, no coords: a region write must not carry the full y/x index.
-    xr.Dataset({k: (('y', 'x'), res[k]) for k in out_vars(a.metrics)}).to_zarr(
+    xr.Dataset({k: (('y', 'x'), res[k]) for k in out_vars(a)}).to_zarr(
         a.output, region={'y': ys, 'x': xs}, consolidated=True)
     logger.info(f'tile {a.tile_index}: fit {int(res["success"].sum())} of {res["success"].size} pixels')
 
@@ -170,8 +235,19 @@ def main(argv=None):
     ap.add_argument('--max-days', type=float, default=None, help='keep pairs up to this many days apart')
     ap.add_argument('--gamma-inf', type=float, default=None,
                     help='fix gamma_inf at this value (default: fit it per pixel)')
+    ap.add_argument('--gamma-0', type=float, default=1.0,
+                    help='fix gamma_0 (coherence at zero time difference) at this value (default: %(default)s)')
+    ap.add_argument('--fit-gamma-0', action='store_true', help='fit gamma_0 per pixel instead of fixing it')
+    ap.add_argument('--swe-zarr', nargs='+', type=Path, default=None,
+                    help='snow model: swe store(s), one per --zarr track in the same order (needs --swe-var, --inc-tif)')
+    ap.add_argument('--swe-var', help='snow model: swe variable name in the --swe-zarr stores')
+    ap.add_argument('--inc-tif', type=Path, help='snow model: local incidence angle GeoTIFF in degrees, on the same grid')
+    ap.add_argument('--kappa-guess', type=float, default=KAPPA_GUESS, help='snow model: starting kappa (default: %(default)s)')
+    ap.add_argument('--kappa-bounds', nargs=2, type=float, default=[0, float('inf')], metavar=('LO', 'HI'),
+                    help='snow model: bounds on kappa (default: 0 inf)')
     ap.add_argument('--metrics', nargs='*', choices=METRICS, default=[],
-                    help='extra output maps: the 1-sigma errors of tau and/or gamma_inf (default: none, R^2 only). '
+                    help='extra output maps: the 1-sigma errors of the fitted parameters (default: none; the goodness '
+                         'of fit is always written). kappa_err needs the snow model. '
                          'Give the same value at --init and for every tile.')
     ap.add_argument('--tau-guess', type=float, default=6, help='starting tau, days (default: %(default)s)')
     ap.add_argument('--tau-bounds', nargs=2, type=float, default=[0, 30], metavar=('LO', 'HI'),
@@ -186,10 +262,16 @@ def main(argv=None):
         return
     if not a.zarr or not a.var:
         ap.error('--zarr and --var are required except with --finalize')
+    if bool(a.swe_zarr) != bool(a.swe_var) or bool(a.swe_zarr) != bool(a.inc_tif):
+        ap.error('--swe-zarr, --swe-var and --inc-tif go together (snow model); give all three or none')
+    if a.swe_zarr and len(a.swe_zarr) != len(a.zarr):
+        ap.error(f'{len(a.swe_zarr)} --swe-zarr stores for {len(a.zarr)} --zarr stores: need one per track')
+    if 'kappa_err' in a.metrics and not a.swe_zarr:
+        ap.error("--metrics kappa_err needs the snow model (--swe-zarr)")
     if a.tile_index is not None:
         fit_tile(a)
         return
-    das, days, grid = open_tracks(a.zarr, a.var, a.start_date, a.end_date, a.max_days)
+    das, days, grid, _ = open_tracks(a.zarr, a.var, a.start_date, a.end_date, a.max_days, a.swe_zarr, a.swe_var)
     if a.n_tiles:
         print(n_tiles(grid.sizes['y'], grid.sizes['x'], a.tile_size))
         return
