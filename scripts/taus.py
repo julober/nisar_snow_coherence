@@ -13,9 +13,13 @@ from scipy.optimize import curve_fit
 GAMMA_INF_GUESS = 0.3
 
 
-def decorrelation_temporal_model(t, gamma_inf, tau):
+def decorrelation_temporal_model(t, gamma_0, gamma_inf, tau):
     """Coherence after a time difference ``t`` (same units as ``tau``) for asymptotic coherence ``gamma_inf``."""
-    return gamma_inf + (1 - gamma_inf) * np.exp(-t / tau)
+    return gamma_inf + (gamma_0 - gamma_inf) * np.exp(-t / tau)
+
+def decorrelation_temporal_model_snow(t, swe, inc, gamma_0, gamma_inf, tau, kappa):
+    """Coherence after a time difference ``t`` (same units as ``tau``) for asymptotic coherence ``gamma_inf``."""
+    return gamma_inf + (gamma_0 - gamma_inf) * np.exp(-t / tau) - (kappa * swe * np.cos(inc / 2))
 
 
 def r_squared(y, y_hat):
@@ -26,7 +30,7 @@ def r_squared(y, y_hat):
     return float(1 - np.sum((y - y_hat) ** 2) / ss_tot)
 
 
-def fit_coh_decay_model(cohs, days, tau_guess=6, tau_bounds=(0, 100), xtol=1e-6, ftol=1e-6, gamma_inf=None):
+def fit_coh_decay_model(cohs, days, tau_guess=6, tau_bounds=(0, 100), xtol=1e-6, ftol=1e-6, gamma_0=None, gamma_inf=None):
     """
     Fit the decay model to one pixel's coherence time series.
 
