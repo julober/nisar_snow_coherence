@@ -67,6 +67,145 @@ def read_mesowest(
     return wind
 
 
+def read_mesowest_wind(files: List[Union[str, Path]]) -> pd.DataFrame:
+    """
+    Read raw (not resampled) wind speed and direction from MesoWest CSVs.
+
+    Direction is an angle, so it must not be averaged arithmetically (359 and
+    1 degrees would average to 180). This keeps every observation as-is.
+
+    Parameters
+    ----------
+    files : list of str | Path
+        MesoWest station CSVs with ``wind_speed_set_1`` (m/s) and
+        ``wind_direction_set_1`` (degrees the wind blows FROM, clockwise from N).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``station``, ``time`` (UTC), ``speed`` (m/s), ``direction``
+        (deg). Rows missing either speed or direction are dropped.
+    """
+    out = []
+    for f in files:
+        df = pd.read_csv(f, comment='#').drop(index=0)  # drop units row
+        out.append(
+            pd.DataFrame(
+                {
+                    'station': df['Station_ID'].values,
+                    'time': pd.to_datetime(df['Date_Time'], utc=True).values,
+                    'speed': df['wind_speed_set_1'].astype(float).values,
+                    'direction': df['wind_direction_set_1'].astype(float).values,
+                }
+            )
+        )
+    return pd.concat(out, ignore_index=True).dropna(subset=['speed', 'direction'])
+
+
+def wind_in_interval(wind: pd.DataFrame, start, end, utc_offset_hours: float = -7) -> pd.DataFrame:
+    """
+    Select wind observations inside ``[start, end)``.
+
+    ``read_mesowest_wind`` times are UTC, while the NISAR pair ``start``/``end``
+    are local standard time (see ``build_cube``), so the offset is applied here.
+
+    Parameters
+    ----------
+    wind : pandas.DataFrame
+        Output of ``read_mesowest_wind``.
+    start, end : datetime-like
+        Interval bounds in local standard time.
+    utc_offset_hours : float
+        Fixed local offset from UTC (no DST); -7 matches ``build_cube``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The rows inside the interval.
+    """
+    local = pd.to_datetime(wind['time']) + pd.Timedelta(hours=utc_offset_hours)
+    return wind[(local >= pd.Timestamp(start)) & (local < pd.Timestamp(end))]
+
+
+def prevailing_direction(speed, direction, min_speed: float = 1.0):
+    """
+    Speed-weighted vector-mean wind direction, ignoring calm observations.
+
+    Parameters
+    ----------
+    speed : array-like
+        Wind speed (m/s).
+    direction : array-like
+        Direction the wind blows FROM (deg, clockwise from north).
+    min_speed : float
+        Observations below this speed (m/s) are treated as calm and ignored.
+
+    Returns
+    -------
+    (float, float)
+        Mean direction in degrees [0, 360), and the resultant length ``R`` in
+        [0, 1] (1 = all wind from one direction, 0 = uniformly scattered).
+    """
+    speed, direction = np.asarray(speed, float), np.asarray(direction, float)
+    keep = speed >= min_speed
+    speed, theta = speed[keep], np.deg2rad(direction[keep])
+    east, north = (speed * np.sin(theta)).mean(), (speed * np.cos(theta)).mean()
+    return float(np.rad2deg(np.arctan2(east, north)) % 360), float(np.hypot(east, north) / speed.mean())
+
+
+def plot_wind_rose(ax, speed, direction, title='', speed_bins=(1, 3, 5, 7, 10, 15, 100), n_dir=16):
+    """
+    Draw a wind rose on a matplotlib polar axis.
+
+    Bars show how often wind blows FROM each direction (north at top, clockwise),
+    stacked and colored by speed class. Calm observations (below the first
+    non-zero bin edge) are not drawn.
+
+    Parameters
+    ----------
+    ax : matplotlib.projections.polar.PolarAxes
+        Axis made with ``projection='polar'``.
+    speed, direction : array-like
+        Wind speed (m/s) and direction FROM (deg).
+    title : str
+        Axis title.
+    speed_bins : sequence of float
+        Speed class edges (m/s).
+    n_dir : int
+        Number of direction sectors.
+
+    Returns
+    -------
+    list
+        Legend handles (one per speed class) for building a shared legend.
+    """
+    import matplotlib.pyplot as plt
+
+    speed, direction = np.asarray(speed, float), np.asarray(direction, float)
+    width = 360.0 / n_dir
+    # Center each sector on its compass point (N sector spans -w/2 .. +w/2).
+    sector = (((direction + width / 2) % 360) // width).astype(int)
+    centers = np.deg2rad(np.arange(n_dir) * width)
+    colors = plt.cm.viridis(np.linspace(0.1, 0.95, len(speed_bins) - 1))
+
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+    bottom = np.zeros(n_dir)
+    handles = []
+    for i, (lo, hi) in enumerate(zip(speed_bins[:-1], speed_bins[1:])):
+        in_bin = (speed >= lo) & (speed < hi)
+        frac = np.bincount(sector[in_bin], minlength=n_dir) / len(speed) * 100
+        label = f'{lo}-{hi} m/s' if hi < 100 else f'>{lo} m/s'
+        h = ax.bar(centers, frac, width=np.deg2rad(width) * 0.9, bottom=bottom, color=colors[i], label=label)
+        handles.append(h)
+        bottom += frac
+    ax.set_title(title, fontsize=10)
+    ax.set_rlabel_position(135)
+    ax.yaxis.set_major_formatter(lambda v, _: f'{v:g}%')
+    ax.tick_params(labelsize=7)
+    return handles
+
+
 def read_snotel(
     files: List[Union[str, Path]], names: Dict[str, str], utc_offset_hours: float
 ) -> xr.Dataset:
@@ -238,3 +377,46 @@ def pair_metrics(
         out[f'wind_event_{f}'] = event_wind_by_pair(swe_accum, wind_speed, starts, ends, threshold, freq=f)
         out[f'swe_max_{f}_x_wind_event'] = out[f'swe_max_{f}'] * out[f'wind_event_{f}']
     return out
+
+
+# Station metadata for the winter overview figure. Elevations in metres: SNOTEL values come from the
+# NRCS AWDB web service (feet, converted); MesoWest values from the CSV headers (feet, converted).
+FT_TO_M: float = 0.3048
+STATION_ELEV_M: Dict[str, float] = {
+    '380': 10190 * FT_TO_M,      # Butte
+    '737': 10640 * FT_TO_M,      # Schofield Pass (SNOTEL)
+    '1141': 10710 * FT_TO_M,     # Upper Taylor
+    '1326': 11510 * FT_TO_M,     # Castle Peak
+    'CACNM': 12301 * FT_TO_M,    # Cinnamon Mtn
+    'CASCP': 11985 * FT_TO_M,    # Irwin Guides Ridge Top
+    'SOSC2': 10700 * FT_TO_M,    # Schofield Pass (MesoWest)
+}
+
+LAPSE_RATE_C_PER_M: float = -6.5 / 1000
+"""Standard-atmosphere lapse rate (degC per m); a rough approximation in winter."""
+
+
+def lapse_adjust(air_temp: xr.DataArray, elev_m: xr.DataArray, ref_elev_m: float, rate: float = LAPSE_RATE_C_PER_M) -> xr.DataArray:
+    """
+    Shift station air temperatures to a common reference elevation.
+
+    ``T_ref = T_station + rate * (ref_elev - station_elev)``, so a station above the reference is
+    warmed and one below is cooled.
+
+    Parameters
+    ----------
+    air_temp : xarray.DataArray
+        Temperature (degC) with a ``station_id`` dim.
+    elev_m : xarray.DataArray
+        Station elevation (m) on ``station_id``.
+    ref_elev_m : float
+        Elevation (m) to adjust to.
+    rate : float
+        Lapse rate in degC per m (negative: colder with height).
+
+    Returns
+    -------
+    xarray.DataArray
+        Temperature at ``ref_elev_m``.
+    """
+    return air_temp + rate * (ref_elev_m - elev_m)
