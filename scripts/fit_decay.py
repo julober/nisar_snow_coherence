@@ -38,6 +38,7 @@ from typing import List, Optional
 
 import numpy as np
 import xarray as xr
+import rioxarray
 
 # Allow `python scripts/fit_decay.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -111,8 +112,11 @@ def open_tracks(stores: List[Path], var: str, start_date, end_date, max_days,
             raise KeyError(f'{store} has no variable {var!r}; it has {list(ds.data_vars)}')
         if first is None:
             first = ds
-        elif not same_grid(ds, first):
-            raise ValueError(f'{store} is not on the same x/y grid as {stores[0]}')
+        elif not (ds['x'].shape == first['x'].shape and ds['y'].shape == first['y'].shape
+                  and np.array_equal(ds['x'].values, first['x'].values)
+                  and np.array_equal(ds['y'].values, first['y'].values)):
+            ds = ds.rio.reproject_match(first)
+            # raise ValueError(f'{store} is not on the same x/y grid as {stores[0]}')
         idx = select_pairs(ds, start_date, end_date, max_days)
         logger.info(f'{store}: {len(idx)} of {ds.sizes["pair"]} pairs selected')
         das.append(ds[var].isel(pair=idx))

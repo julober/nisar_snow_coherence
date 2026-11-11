@@ -13,7 +13,7 @@
 #SBATCH --cpus-per-task=1        # the fit is a single-threaded loop; parallelism comes from the array
 #SBATCH --mem=8G                 # PLACEHOLDER: a 256x256 tile of all pairs is small; raise for many pairs
 #SBATCH --time=03:00:00          # PLACEHOLDER: depends on pairs per pixel; check one task's runtime first
-#SBATCH -p bsudfq # queue (partition)
+#SBATCH -p cryogars # queue (partition)
 #SBATCH --mail-user=julialober@u.boisestate.edu
 #SBATCH --mail-type=END
 

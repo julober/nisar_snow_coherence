@@ -7,14 +7,14 @@
 #SBATCH -t 12:00:00 # run time (hh:mm:ss)
 #SBATCH --mail-user=julialober@u.boisestate.edu
 #SBATCH --mail-type=END
-#SBATCH --array=1-1 # one task per row of tracks_frames.txt; update when adding rows
+#SBATCH --array=1-4 # one task per row of tracks_frames.txt; update when adding rows
 
 # ----------------------------- configuration -----------------------------
 REPO=/bsuhome/julialober/nisar_snow_coherence            # TODO: repo location on the cluster
-PYTHON=/bsuhome/julialober/miniforge3/envs/nisar_snow_coherence/bin/python  # TODO: env name
-ENV_FILE=/bsuhome/julialober/.env                        # TODO: file exporting EARTHDATA_TOKEN
+PYTHON=/bsuhome/julialober/miniforge3/envs/coherence_v2/bin/python  # TODO: env name
+# ENV_FILE=/bsuhome/julialober/.env                        # TODO: file exporting EARTHDATA_TOKEN
 TRACK_FILE=$REPO/scripts/slurm/tracks_frames.txt
-OUT_ROOT=/bsuhome/julialober/scratch/coherence_data/nisar
+OUT_ROOT=/bsuhome/julialober/scratch/coherence_data/nisar/east_river
 
 START=2025-12-01
 END=2026-04-30

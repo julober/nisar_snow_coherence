@@ -25,8 +25,8 @@
 #SBATCH --output=/bsuhome/julialober/logs/%x_%A.out
 #SBATCH --cpus-per-task=8        # PLACEHOLDER: batches run at the same time, one per CPU
 #SBATCH --mem=64G                # PLACEHOLDER: about CPUs x one batch; check MaxRSS of a first run with sacct
-#SBATCH --time=12:00:00          # PLACEHOLDER: depends on the number of pairs; check a first run
-#SBATCH -p bsudfq # queue (partition)
+#SBATCH --time=3:00:00          # PLACEHOLDER: depends on the number of pairs; check a first run
+#SBATCH -p cryogars # queue (partition)
 #SBATCH --mail-user=julialober@u.boisestate.edu
 #SBATCH --mail-type=END
 
@@ -36,11 +36,11 @@ set -euo pipefail
 # ----------------------------- configuration -----------------------------
 TRACK=${TRACK:?set TRACK, e.g. TRACK=19 sbatch scripts/slurm/gamma_temporal.sbatch}
 FRAME=${FRAME:?set FRAME, e.g. FRAME=21}
-GUNW_ROOT=${GUNW_ROOT:?set GUNW_ROOT to the folder holding <TTT>_<A|D>_<FFF>/<ref>-<sec>_POE}
+GUNW_ROOT=${GUNW_ROOT:-/bsuhome/julialober/scratch/coherence_data/nisar/east_river_coreg/}
 DATA_DIR=${DATA_DIR:-/bsuhome/julialober/scratch/coherence_data}
 ASO=${ASO:-}
 ORBIT=${ORBIT:-poe}
-PAIR_CHUNK=${PAIR_CHUNK:-20}
+PAIR_CHUNK=${PAIR_CHUNK:-10}
 # --------------------------------------------------------------------------
 
 ARGS=(--track "$TRACK" --frame "$FRAME" --gunw-root "$GUNW_ROOT" --data-dir "$DATA_DIR"
@@ -51,4 +51,4 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate coherence_v2
 
 echo "track $TRACK, frame $FRAME, GUNWs in $GUNW_ROOT, data in $DATA_DIR, ASO mask: ${ASO:-none}"
-python scripts/gamma_temporal.py "${ARGS[@]}" "$@"
+python ../gamma_temporal.py "${ARGS[@]}" "$@"
