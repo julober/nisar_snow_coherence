@@ -19,10 +19,12 @@ variable with ``start`` / ``end`` coords on the same x/y grid; its pairs are mat
 dates. ``--inc-tif`` is the local incidence angle in DEGREES on the same grid (e.g. from ``scripts/lia.py``).
 
 gamma_0 is fixed at 1 unless you pass ``--gamma-0 <value>`` (another fixed value) or ``--fit-gamma-0`` (fit it).
+The snow parameters k, s0 and p are fixed at 100, 5 and 5 unless you pass ``--k <value>`` (etc.) or ``--fit-k`` (etc.);
+``--k-bounds LO HI`` (etc.) sets the bounds of a fitted one.
 
 Output: one Zarr with (y, x) maps ``tau`` (days), ``gamma_inf``, ``gamma_0``, ``nse``, ``kge`` and ``pearson_r`` (the
-goodness of fit), ``n_pairs`` and ``success``, plus ``kappa`` for the snow model. ``--metrics`` (any of tau_err
-gamma_inf_err gamma_0_err kappa_err) adds the 1-sigma parameter errors. Its chunks are the tiles, so array tasks never
+goodness of fit), ``n_pairs`` and ``success``, plus ``k``, ``s0`` and ``p`` for the snow model. ``--metrics`` (any of
+tau_err gamma_inf_err gamma_0_err k_err s0_err p_err) adds the 1-sigma parameter errors. Its chunks are the tiles, so array tasks never
 write the same chunk.
 
 Steps the wrapper runs, to do by hand (use the same data/fit arguments for all three, they define which pairs are fit):
@@ -42,7 +44,8 @@ import rioxarray
 
 # Allow `python scripts/fit_decay.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.taus import BASE_MAPS, KAPPA_GUESS, METRICS, get_taus_spatial  # noqa: E402
+from scripts.taus import (BASE_MAPS, METRICS, SNOW_BOUNDS, SNOW_DEFAULTS, SNOW_MAPS, SNOW_METRICS,  # noqa: E402
+                          get_taus_spatial)
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +59,19 @@ def is_snow(a) -> bool:
 
 
 def out_vars(a) -> dict:
-    """``OUT_VARS`` plus ``kappa`` (snow model) and the optional error maps asked for with --metrics."""
-    return {**OUT_VARS, **({'kappa': 'float32'} if is_snow(a) else {}), **{m: 'float32' for m in a.metrics}}
+    """``OUT_VARS`` plus ``k``, ``s0``, ``p`` (snow model) and the optional error maps asked for with --metrics."""
+    return {**OUT_VARS, **({m: 'float32' for m in SNOW_MAPS} if is_snow(a) else {}),
+            **{m: 'float32' for m in a.metrics}}
 
 
 def gamma_0_value(a):
     """The gamma_0 passed to the fit: None (fit it) with --fit-gamma-0, else the fixed value."""
     return None if a.fit_gamma_0 else a.gamma_0
+
+
+def snow_value(a, name):
+    """The k / s0 / p passed to the fit: None (fit it) with --fit-<name>, else the fixed value."""
+    return None if getattr(a, f'fit_{name}') else getattr(a, name)
 
 
 def select_pairs(ds: xr.Dataset, start_date, end_date, max_days) -> np.ndarray:
@@ -170,7 +179,8 @@ def init_output(a, days, grid) -> int:
     )
     if is_snow(a):
         out.attrs.update(swe_var=a.swe_var, swe_stores=[str(s) for s in a.swe_zarr], inc_tif=str(a.inc_tif),
-                         kappa_guess=a.kappa_guess, kappa_bounds=list(a.kappa_bounds))
+                         **{n: 'fit' if snow_value(a, n) is None else snow_value(a, n) for n in SNOW_MAPS},
+                         **{f'{n}_bounds': list(getattr(a, f'{n}_bounds')) for n in SNOW_MAPS})
     out.to_zarr(a.output, mode='w', compute=False, consolidated=True)
     return n_tiles(ny, nx, a.tile_size)
 
@@ -201,8 +211,9 @@ def fit_tile(a) -> None:
         inc_block = load_inc(a.inc_tif, grid)[ys, xs]
     res = get_taus_spatial(block, days, tau_guess=a.tau_guess, tau_bounds=tuple(a.tau_bounds),
                            gamma_0=gamma_0_value(a), gamma_inf=a.gamma_inf, min_pairs=a.min_pairs,
-                           metrics=a.metrics, swe_arr=swe_block, inc=inc_block, kappa_guess=a.kappa_guess,
-                           kappa_bounds=tuple(a.kappa_bounds))
+                           metrics=a.metrics, swe_arr=swe_block, inc=inc_block,
+                           **{n: snow_value(a, n) for n in SNOW_MAPS},
+                           **{f'{n}_bounds': tuple(getattr(a, f'{n}_bounds')) for n in SNOW_MAPS})
     # Only data variables, no coords: a region write must not carry the full y/x index.
     xr.Dataset({k: (('y', 'x'), res[k]) for k in out_vars(a)}).to_zarr(
         a.output, region={'y': ys, 'x': xs}, consolidated=True)
@@ -246,12 +257,15 @@ def main(argv=None):
                     help='snow model: swe store(s), one per --zarr track in the same order (needs --swe-var, --inc-tif)')
     ap.add_argument('--swe-var', help='snow model: swe variable name in the --swe-zarr stores')
     ap.add_argument('--inc-tif', type=Path, help='snow model: local incidence angle GeoTIFF in degrees, on the same grid')
-    ap.add_argument('--kappa-guess', type=float, default=KAPPA_GUESS, help='snow model: starting kappa (default: %(default)s)')
-    ap.add_argument('--kappa-bounds', nargs=2, type=float, default=[0, float('inf')], metavar=('LO', 'HI'),
-                    help='snow model: bounds on kappa (default: 0 inf)')
+    for n in SNOW_MAPS:  # snow model: --k / --s0 / --p (fixed value), --fit-k / ... (fit), --k-bounds / ... (fit bounds)
+        ap.add_argument(f'--{n}', type=float, default=SNOW_DEFAULTS[n],
+                        help=f'snow model: fix {n} at this value (default: %(default)s)')
+        ap.add_argument(f'--fit-{n}', action='store_true', help=f'snow model: fit {n} per pixel instead of fixing it')
+        ap.add_argument(f'--{n}-bounds', nargs=2, type=float, default=list(SNOW_BOUNDS[n]), metavar=('LO', 'HI'),
+                        help=f'snow model: bounds on {n} when fit (default: %(default)s)')
     ap.add_argument('--metrics', nargs='*', choices=METRICS, default=[],
                     help='extra output maps: the 1-sigma errors of the fitted parameters (default: none; the goodness '
-                         'of fit is always written). kappa_err needs the snow model. '
+                         'of fit is always written). k_err, s0_err and p_err need the snow model. '
                          'Give the same value at --init and for every tile.')
     ap.add_argument('--tau-guess', type=float, default=6, help='starting tau, days (default: %(default)s)')
     ap.add_argument('--tau-bounds', nargs=2, type=float, default=[0, 30], metavar=('LO', 'HI'),
@@ -270,8 +284,8 @@ def main(argv=None):
         ap.error('--swe-zarr, --swe-var and --inc-tif go together (snow model); give all three or none')
     if a.swe_zarr and len(a.swe_zarr) != len(a.zarr):
         ap.error(f'{len(a.swe_zarr)} --swe-zarr stores for {len(a.zarr)} --zarr stores: need one per track')
-    if 'kappa_err' in a.metrics and not a.swe_zarr:
-        ap.error("--metrics kappa_err needs the snow model (--swe-zarr)")
+    if set(a.metrics) & set(SNOW_METRICS) and not a.swe_zarr:
+        ap.error(f"--metrics {' '.join(SNOW_METRICS)} need the snow model (--swe-zarr)")
     if a.tile_index is not None:
         fit_tile(a)
         return
