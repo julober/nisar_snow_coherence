@@ -30,13 +30,13 @@ def decorrelation_temporal_model_snow(t, swe, inc, gamma_0, gamma_inf, tau, k, s
     inc : local incidence angle in DEGREES (converted to radians here)
     """
     return (decorrelation_temporal_model(t, gamma_0, gamma_inf, tau)
-            * gamma_snow(swe, inc, k, s0, p, gamma_inf))
+            * gamma_snow(swe, inc, k, s0, p))
 
-def gamma_snow(swe, theta, k=100, s0=5, p=5, gamma_inf=0.15):
+def gamma_snow(swe, theta, k=100, s0=5, p=5):
     a = np.cos(np.deg2rad(theta) / 2.0) 
     w = 1.0 - np.exp(-swe / s0) 
     # w = 1
-    return (1 - gamma_inf) * np.exp(-swe / k) * (a ** (p * w)) + gamma_inf
+    return np.exp(-swe / k) * (a ** (p * w)) 
 
 # ---------------------------------------------------------------------------------------------------------------
 # Goodness of fit. ``y`` is the observation and ``y_hat`` the model; all return a float, NaN if undefined.
