@@ -22,16 +22,21 @@ def decorrelation_temporal_model(t, gamma_0, gamma_inf, tau):
     return gamma_inf + (gamma_0 - gamma_inf) * np.exp(-t / tau)
 
 
-def decorrelation_temporal_model_snow(t, swe, inc, gamma_0, gamma_inf, tau, kappa):
+def decorrelation_temporal_model_snow(t, swe, inc, gamma_0, gamma_inf, tau, k, s0, p):
     """
-    The decay model with a snow term: the coherence is lowered by ``kappa * swe * cos(inc / 2)``.
+    The decay model with a snow term.
 
     swe : snow water equivalent of the pair (``kappa`` carries its units)
     inc : local incidence angle in DEGREES (converted to radians here)
     """
     return (decorrelation_temporal_model(t, gamma_0, gamma_inf, tau)
-            - kappa * swe * np.cos(np.deg2rad(inc) / 2))
+            * gamma_snow(swe, inc, k, s0, p, gamma_inf))
 
+def gamma_snow(swe, theta, k=100, s0=5, p=5, gamma_inf=0.15):
+    a = np.cos(np.deg2rad(theta) / 2.0) 
+    w = 1.0 - np.exp(-swe / s0) 
+    # w = 1
+    return (1 - gamma_inf) * np.exp(-swe / k) * (a ** (p * w)) + gamma_inf
 
 # ---------------------------------------------------------------------------------------------------------------
 # Goodness of fit. ``y`` is the observation and ``y_hat`` the model; all return a float, NaN if undefined.
